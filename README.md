@@ -2,6 +2,8 @@
 
 A reusable Python tool that downloads an Onshape assembly, writes a GLB with optional edge overlays, and (optionally) bakes motion transforms by sweeping a configuration parameter. This directory is designed to be copied out of the tutorial repository or published alongside the article so others can reuse the exporter without the full site.
 
+<img width="928" height="531" alt="image" src="https://github.com/user-attachments/assets/b0c497ce-c455-4dc8-83f0-e5b6e2776ef8" />
+
 ## Features
 - Fetch tessellated faces (and optional edges) for any assembly element
 - Build a GLB plus an `occ2node.json` map that records which occurrences map to which scene nodes
