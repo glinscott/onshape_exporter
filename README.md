@@ -1,6 +1,6 @@
 # Onshape Exporter
 
-A reusable Python tool that downloads an Onshape assembly, writes a GLB with optional edge overlays, and (optionally) bakes motion transforms by sweeping a configuration parameter. This directory is designed to be copied out of the tutorial repository or published alongside the article so others can reuse the exporter without the full site.
+A reusable Python tool that downloads an Onshape assembly, writes a GLB with optional edge overlays, and (optionally) bakes motion transforms by sweeping a configuration parameter. 
 
 <img width="928" height="531" alt="image" src="https://github.com/user-attachments/assets/b0c497ce-c455-4dc8-83f0-e5b6e2776ef8" />
 
@@ -69,11 +69,9 @@ uv run onshape_exporter.py \
 This writes the GLB, occurrence map, motion table, and an optimised GLB (if gltfpack is present).
 
 ## View the output
-You can preview the exported bundle without installing the full Vite site. Start a static server from the repository root so the viewer can reach the `out/` directory, then open the exporter page.
-
 ```
 python -m http.server 8000
-# open http://localhost:8000/exporter/
+# open http://localhost:8000/
 ```
 The viewer automatically loads `out/assembly.glb`, `out/occ2node.json`, and (if present) `out/motion.json`.
 
