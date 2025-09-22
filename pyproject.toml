@@ -1,0 +1,19 @@
+[project]
+name = "onshape-exporter"
+version = "0.1.0"
+description = "Reusable Onshape assembly exporter for GLB + motion data"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.24",
+  "requests>=2.31",
+  "trimesh>=4.0",
+  "scipy>=1.10",
+]
+
+[project.scripts]
+onshape-exporter = "onshape_exporter:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

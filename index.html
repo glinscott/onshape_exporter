@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Onshape Exporter</title>
+  <style>
+    :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; padding: 0; background: #f5f5f5; color: #222; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #111; color: #ddd; }
+      a { color: #9cc9ff; }
+      label { color: inherit; }
+    }
+    main { max-width: 900px; margin: 2.5rem auto; padding: 0 1.5rem 4rem; line-height: 1.6; }
+    h1, h2 { line-height: 1.2; }
+    pre { background: rgba(0,0,0,0.05); padding: 1rem; border-radius: 0.5rem; overflow-x: auto; }
+    code { font-family: ui-monospace, SFMono-Regular, SFMono, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    #viewer { margin-top: 2rem; }
+    #canvas-container { width: 100%; height: 520px; background: rgba(0,0,0,0.08); border-radius: 0.75rem; overflow: hidden; position: relative; }
+    #canvas-container canvas { width: 100%; height: 100%; display: block; }
+    #controls { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; margin-top: 1rem; }
+    #controls button { padding: 0.4rem 0.9rem; font-size: 0.95rem; border-radius: 0.5rem; border: none; background: #1f6feb; color: white; cursor: pointer; }
+    #controls button[disabled] { opacity: 0.5; cursor: not-allowed; }
+    #controls input[type="range"] { flex: 1 1 220px; }
+    ul { padding-left: 1.2rem; }
+    li { margin-bottom: 0.35rem; }
+    footer { margin-top: 3rem; font-size: 0.875rem; color: rgba(0,0,0,0.6); }
+    .status-line { margin-top: 0.75rem; font-size: 0.95rem; color: rgba(0,0,0,0.65); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Onshape Exporter</h1>
+    <p>A lightweight Python CLI for turning an Onshape assembly into a GLB bundle with optional motion data and glTF optimisation. Share this folder as-is to give readers a working exporter plus a viewer.</p>
+
+    <h2>CLI Quick Start</h2>
+    <pre><code>pip install ./exporter
+export ONSHAPE_ACCESS_KEY=...
+export ONSHAPE_SECRET_KEY=...
+onshape-exporter --assembly https://cad.onshape.com/documents/&lt;did&gt;/w/&lt;wid&gt;/e/&lt;eid&gt; \
+  --motion-parameter thetaDeg \
+  --frame-count 72 \
+  --optimise \
+  --out ./out</code></pre>
+
+    <h2>Serve The Viewer</h2>
+    <p>The viewer loads <code>out/assembly.glb</code>, <code>out/occ2node.json</code>, and (optionally) <code>out/motion.json</code> automatically. Run a static server from the repository root so those paths resolve:</p>
+    <pre><code>python -m http.server 8000
+# then open: http://localhost:8000/exporter/</code></pre>
+
+    <section id="viewer">
+      <h2>Interactive Viewer</h2>
+      <p>Once the server is running and the exporter has populated <code>out/</code>, the scene below will hydrate automatically. If <code>motion.json</code> is present the controls enable playback.</p>
+      <div id="controls">
+        <button id="playButton" disabled>Play</button>
+        <input type="range" id="frameSlider" min="0" max="0" value="0" disabled>
+        <span id="frameInfo">Frame 0</span>
+        <span id="valueInfo"></span>
+      </div>
+      <div id="canvas-container"></div>
+      <p id="status" class="status-line">Waiting for assets in <code>out/</code>…</p>
+    </section>
+
+    <h2>Helpful Flags</h2>
+    <ul>
+      <li><code>--partstudio</code> to list specific Part Studio element IDs</li>
+      <li><code>--skip-edges</code> when you only need solid geometry</li>
+      <li><code>--faces-cache</code> / <code>--edges-cache</code> to persist tessellation JSON</li>
+      <li><code>--value-template</code> to tweak the configuration literal (default <code>{value} degree</code>)</li>
+    </ul>
+
+    <p>See the accompanying <a href="README.md">README</a> for the full CLI reference and implementation details.</p>
+
+    <footer>
+      Built from the stationary engine tutorial exporter. Fork it, remix it, and send improvements back!
+    </footer>
+  </main>
+
+  <script type="module">
+    import * as THREE from "https://esm.sh/three@0.164.1";
+    import { OrbitControls } from "https://esm.sh/three@0.164.1/examples/jsm/controls/OrbitControls.js?deps=three@0.164.1";
+    import { GLTFLoader } from "https://esm.sh/three@0.164.1/examples/jsm/loaders/GLTFLoader.js?deps=three@0.164.1";
+    import { RoomEnvironment } from "https://esm.sh/three@0.164.1/examples/jsm/environments/RoomEnvironment.js?deps=three@0.164.1";
+
+    const statusEl = document.getElementById("status");
+    const playButton = document.getElementById("playButton");
+    const frameSlider = document.getElementById("frameSlider");
+    const frameInfo = document.getElementById("frameInfo");
+    const valueInfo = document.getElementById("valueInfo");
+    const container = document.getElementById("canvas-container");
+
+    const loader = new GLTFLoader();
+    loader.setCrossOrigin("anonymous");
+    const tmpMatrix = new THREE.Matrix4();
+
+    const textureLoader = new THREE.TextureLoader();
+    const matcapUrl = new URL("./onshape-matcap-128.png", import.meta.url).href;
+    const matcapTexture = textureLoader.load(matcapUrl);
+    matcapTexture.colorSpace = THREE.SRGBColorSpace;
+
+    const solidMaterial = new THREE.MeshMatcapMaterial({
+      matcap: matcapTexture,
+      vertexColors: true,
+      polygonOffset: true,
+      polygonOffsetFactor: 2,
+      polygonOffsetUnits: 1,
+    });
+
+    const lineMaterial = new THREE.LineBasicMaterial({
+      color: 0x000000,
+      depthTest: true,
+      depthWrite: false,
+    });
+
+    lineMaterial.onBeforeCompile = (shader) => {
+      const finalBrace = shader.vertexShader.lastIndexOf("}");
+      const injection = `\n    gl_Position.z -= 0.0005 * gl_Position.w;\n  `;
+      shader.vertexShader = [
+        shader.vertexShader.slice(0, finalBrace),
+        injection,
+        shader.vertexShader.slice(finalBrace),
+      ].join("\n");
+    };
+
+    const state = {
+      renderer: null,
+      scene: null,
+      camera: null,
+      controls: null,
+      modelGroup: null,
+      occMap: null,
+      occNodes: new Map(),
+      motion: null,
+      playing: false,
+      frameIndex: 0,
+      frameDuration: 1000 / 24,
+      lastFrameTime: 0,
+      orthoHalfHeight: 1,
+    };
+
+    const assetBase = new URL("../out/", import.meta.url);
+
+    initThree();
+    animate();
+    bootstrap();
+
+    playButton.addEventListener("click", () => {
+      if (!state.motion) return;
+      state.playing = !state.playing;
+      playButton.textContent = state.playing ? "Pause" : "Play";
+      if (state.playing) state.lastFrameTime = 0;
+    });
+
+    frameSlider.addEventListener("input", (event) => {
+      const idx = Number(event.target.value);
+      state.playing = false;
+      playButton.textContent = "Play";
+      applyFrame(idx);
+    });
+
+    async function bootstrap() {
+      try {
+        setStatus("Loading assembly.glb from out/…");
+        await loadGLBFromURL(assetPath("assembly.glb"));
+        setStatus("Loading occ2node.json…");
+        await loadOccMap(assetPath("occ2node.json"));
+      } catch (err) {
+        console.error(err);
+        setStatus("Failed to load assembly outputs from out/. Run the exporter first.");
+        return;
+      }
+
+      try {
+        setStatus("Loading motion.json (optional)…");
+        await loadMotion(assetPath("motion.json"));
+        setStatus("All assets loaded. Use Play or scrub the slider.");
+      } catch (err) {
+        console.warn("Motion data not loaded", err);
+        setStatus("Geometry loaded. motion.json not found (playback controls disabled).");
+      }
+    }
+
+    function assetPath(file) {
+      return new URL(file, assetBase).href;
+    }
+
+    function initThree() {
+      state.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      state.renderer.setPixelRatio(window.devicePixelRatio);
+      state.renderer.outputColorSpace = THREE.SRGBColorSpace;
+      state.renderer.toneMapping = THREE.NoToneMapping;
+      state.renderer.setSize(container.clientWidth, container.clientHeight);
+      container.appendChild(state.renderer.domElement);
+
+      state.scene = new THREE.Scene();
+      state.scene.background = new THREE.Color(0xf0f0f0);
+
+      const aspect = container.clientWidth / Math.max(container.clientHeight, 1);
+      state.camera = new THREE.OrthographicCamera(-aspect, aspect, 1, -1, 0.01, 2000);
+
+      state.controls = new OrbitControls(state.camera, state.renderer.domElement);
+      state.controls.enableDamping = true;
+      state.controls.enableRotate = true;
+      state.controls.zoomSpeed = 1.2;
+
+      const pmrem = new THREE.PMREMGenerator(state.renderer);
+      state.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+      const grid = new THREE.GridHelper(20, 20, 0xaaaaaa, 0xdddddd);
+      grid.position.y = -0.001;
+      state.scene.add(grid);
+
+      updateOrthoFrustum();
+      window.addEventListener("resize", onWindowResize);
+    }
+
+    function onWindowResize() {
+      updateOrthoFrustum();
+    }
+
+    function updateOrthoFrustum() {
+      if (!state.camera || !state.renderer) return;
+      const width = container.clientWidth || 1;
+      const height = container.clientHeight || 1;
+      const aspect = width / height;
+      const half = state.orthoHalfHeight || 1;
+      state.camera.left = -half * aspect;
+      state.camera.right = half * aspect;
+      state.camera.top = half;
+      state.camera.bottom = -half;
+      state.camera.updateProjectionMatrix();
+      state.renderer.setSize(width, height);
+    }
+
+    function frameModel(object) {
+      const box = new THREE.Box3().setFromObject(object);
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z) || 1;
+
+      const dir = new THREE.Vector3(0, -1, 0)
+        .applyAxisAngle(new THREE.Vector3(0, 0, 1), THREE.MathUtils.degToRad(15))
+        .applyAxisAngle(new THREE.Vector3(1, 0, 0), THREE.MathUtils.degToRad(-25.264))
+        .normalize();
+      const distance = size.length() || maxDim;
+
+      state.camera.position.copy(center).addScaledVector(dir, distance);
+      state.camera.up.set(0, 0, 1);
+      state.camera.lookAt(center);
+
+      state.controls.target.copy(center);
+      state.controls.update();
+
+      const radius = Math.max(maxDim * 0.5, 0.5);
+      const camDist = state.camera.position.distanceTo(center);
+      state.camera.near = Math.max(0.01, camDist - radius * 4);
+      state.camera.far = camDist + radius * 4;
+      state.camera.updateProjectionMatrix();
+
+      state.orthoHalfHeight = radius * 1.8;
+      updateOrthoFrustum();
+    }
+
+    function loadGLBFromURL(url) {
+      return new Promise((resolve, reject) => {
+        loader.load(url, (gltf) => {
+          if (state.modelGroup) {
+            state.scene.remove(state.modelGroup);
+            state.modelGroup.traverse((child) => {
+              if (child.geometry) child.geometry.dispose?.();
+            });
+          }
+          state.modelGroup = gltf.scene;
+          state.scene.add(state.modelGroup);
+
+          state.modelGroup.traverse((child) => {
+            if (child.isMesh) {
+              child.material = solidMaterial;
+              child.renderOrder = 0;
+              if (child.geometry && child.geometry.computeVertexNormals) {
+                child.geometry.computeVertexNormals();
+              }
+            }
+            if (child.isLine || child.isLineSegments) {
+              child.material = lineMaterial;
+              child.renderOrder = 1;
+            }
+          });
+
+          state.modelGroup.updateMatrixWorld(true);
+          frameModel(state.modelGroup);
+          buildOccNodeMap();
+          resolve();
+        }, undefined, (err) => {
+          reject(err || new Error("Failed to load GLB"));
+        });
+      });
+    }
+
+    async function loadOccMap(url) {
+      const response = await fetch(url, { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status} while fetching occ2node.json`);
+      state.occMap = await response.json();
+      buildOccNodeMap();
+    }
+
+    async function loadMotion(url) {
+      const response = await fetch(url, { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status} while fetching motion.json`);
+      const motion = await response.json();
+      normalizeMotion(motion);
+      state.motion = motion;
+      setupMotionControls();
+      applyFrame(0);
+    }
+
+    function normalizeMotion(motion) {
+      const table = Array.isArray(motion.matrixTable) ? motion.matrixTable : null;
+      if (!table) return;
+      motion.frames.forEach((frame) => {
+        const entries = Object.entries(frame.occurrences || {});
+        for (const [occKey, value] of entries) {
+          if (typeof value === 'number') {
+            const resolved = table[value];
+            if (resolved) frame.occurrences[occKey] = resolved;
+            else delete frame.occurrences[occKey];
+          }
+        }
+      });
+    }
+
+    function buildOccNodeMap() {
+      state.occNodes.clear();
+      if (!state.modelGroup || !state.occMap) return;
+      for (const [occPath, mapping] of Object.entries(state.occMap)) {
+        const nodeNames = Object.values(mapping);
+        const nodes = [];
+        for (const name of nodeNames) {
+          const node = state.modelGroup.getObjectByName(name);
+          if (!node) continue;
+          node.matrixAutoUpdate = false;
+          node.matrix.copy(node.matrixWorld);
+          node.matrix.decompose(node.position, node.quaternion, node.scale);
+          node.matrixWorldNeedsUpdate = true;
+          nodes.push(node);
+        }
+        if (nodes.length) state.occNodes.set(occPath, nodes);
+      }
+    }
+
+    function setupMotionControls() {
+      if (!state.motion || !state.motion.frames?.length) {
+        frameSlider.disabled = true;
+        playButton.disabled = true;
+        return;
+      }
+      state.frameIndex = 0;
+      frameSlider.min = 0;
+      frameSlider.max = state.motion.frames.length - 1;
+      frameSlider.value = 0;
+      frameSlider.disabled = false;
+      playButton.disabled = false;
+      playButton.textContent = "Play";
+      updateFrameUI(0, state.motion.frames[0]?.value);
+    }
+
+    function applyFrame(index) {
+      if (!state.motion || !state.motion.frames?.length) {
+        updateFrameUI(0);
+        return;
+      }
+      const clamped = Math.max(0, Math.min(index, state.motion.frames.length - 1));
+      state.frameIndex = clamped;
+      frameSlider.value = String(clamped);
+      const frame = state.motion.frames[clamped];
+      if (!frame) return;
+      for (const [occPath, matrixRef] of Object.entries(frame.occurrences || {})) {
+        const nodes = state.occNodes.get(occPath);
+        const matrixValues = resolveMatrix(matrixRef);
+        if (!nodes || !matrixValues) continue;
+        tmpMatrix.fromArray(matrixValues).transpose();
+        for (const node of nodes) {
+          node.matrix.copy(tmpMatrix);
+          node.matrix.decompose(node.position, node.quaternion, node.scale);
+          node.matrixWorldNeedsUpdate = true;
+        }
+      }
+      updateFrameUI(clamped, frame.value);
+    }
+
+    function updateFrameUI(index, value) {
+      frameInfo.textContent = `Frame ${index + 1}/${state.motion ? state.motion.frames.length : 1}`;
+      valueInfo.textContent = value !== undefined ? `Value: ${value}` : "";
+    }
+
+    function resolveMatrix(ref) {
+      if (!ref) return null;
+      if (Array.isArray(ref)) return ref;
+      if (typeof ref === 'number' && state.motion?.matrixTable) {
+        return state.motion.matrixTable[ref] || null;
+      }
+      return null;
+    }
+
+    function setStatus(message) {
+      statusEl.textContent = message;
+    }
+
+    function animate(time = 0) {
+      requestAnimationFrame(animate);
+      if (state.playing && state.motion) {
+        if (!state.lastFrameTime) state.lastFrameTime = time;
+        const delta = time - state.lastFrameTime;
+        if (delta >= state.frameDuration) {
+          const framesToAdvance = Math.max(1, Math.floor(delta / state.frameDuration));
+          state.lastFrameTime = time;
+          advanceFrame(framesToAdvance);
+        }
+      }
+      state.controls?.update();
+      state.renderer?.render(state.scene, state.camera);
+    }
+
+    function advanceFrame(step) {
+      if (!state.motion || !state.motion.frames?.length) return;
+      const frameCount = state.motion.frames.length;
+      state.frameIndex = (state.frameIndex + step) % frameCount;
+      applyFrame(state.frameIndex);
+    }
+  </script>
+</body>
+</html>
